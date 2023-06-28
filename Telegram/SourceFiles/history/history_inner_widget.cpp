@@ -33,7 +33,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/menu/menu_multiline_action.h"
 #include "ui/widgets/popup_menu.h"
 #include "ui/image/image.h"
-#include "ui/toasts/common_toasts.h"
 #include "ui/effects/path_shift_gradient.h"
 #include "ui/effects/message_sending_animation_controller.h"
 #include "ui/effects/reaction_fly_animation.h"
@@ -139,7 +138,7 @@ void FillSponsoredMessagesMenu(
 		not_null<Ui::PopupMenu*> menu) {
 	const auto &data = controller->session().data().sponsoredMessages();
 	const auto info = data.lookupDetails(itemId).info;
-	const auto toastParent = Window::Show(controller).toastParent();
+	const auto show = controller->uiShow();
 	if (!info.empty()) {
 		auto fillSubmenu = [&](not_null<Ui::PopupMenu*> menu) {
 			const auto allText = ranges::accumulate(
@@ -150,10 +149,7 @@ void FillSponsoredMessagesMenu(
 				}).text;
 			const auto callback = [=] {
 				QGuiApplication::clipboard()->setText(allText);
-				Ui::ShowMultilineToast({
-					.parentOverride = toastParent,
-					.text = { tr::lng_text_copied(tr::now) },
-				});
+				show->showToast(tr::lng_text_copied(tr::now));
 			};
 			for (const auto &i : info) {
 				auto item = base::make_unique_q<Ui::Menu::MultilineAction>(
@@ -2042,7 +2038,8 @@ void HistoryInner::mouseDoubleClickEvent(QMouseEvent *e) {
 		&& (_mouseCursorState == CursorState::None
 			|| _mouseCursorState == CursorState::Date)
 		&& !inSelectionMode()
-		&& !_emptyPainter) {
+		&& !_emptyPainter
+		&& e->button() == Qt::LeftButton) {
 		if (const auto view = Element::Moused()) {
 			mouseActionCancel();
 			switch (HistoryView::CurrentQuickAction()) {
@@ -2128,21 +2125,30 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 		isUponSelected = hasSelected;
 	}
 
-	const auto hasWhoReactedItem = _dragStateItem
-		&& Api::WhoReactedExists(_dragStateItem, Api::WhoReactedList::All);
+	const auto groupLeaderOrSelf = [](HistoryItem *item) -> HistoryItem* {
+		if (!item) {
+			return nullptr;
+		} else if (const auto group = item->history()->owner().groups().find(item)) {
+			return group->items.front();
+		}
+		return item;
+	};
+	const auto whoReactedItem = groupLeaderOrSelf(_dragStateItem);
+	const auto hasWhoReactedItem = whoReactedItem
+		&& Api::WhoReactedExists(whoReactedItem, Api::WhoReactedList::All);
 	const auto clickedReaction = link
 		? link->property(
 			kReactionsCountEmojiProperty).value<Data::ReactionId>()
 		: Data::ReactionId();
 	_whoReactedMenuLifetime.destroy();
 	if (!clickedReaction.empty()
-		&& _dragStateItem
-		&& Api::WhoReactedExists(_dragStateItem, Api::WhoReactedList::One)) {
+		&& whoReactedItem
+		&& Api::WhoReactedExists(whoReactedItem, Api::WhoReactedList::One)) {
 		HistoryView::ShowWhoReactedMenu(
 			&_menu,
 			e->globalPos(),
 			this,
-			_dragStateItem,
+			whoReactedItem,
 			clickedReaction,
 			_controller,
 			_whoReactedMenuLifetime);
@@ -2152,14 +2158,6 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 	_menu = base::make_unique_q<Ui::PopupMenu>(this, st::popupMenuWithIcons);
 	const auto session = &this->session();
 	const auto controller = _controller;
-	const auto groupLeaderOrSelf = [](HistoryItem *item) -> HistoryItem* {
-		if (!item) {
-			return nullptr;
-		} else if (const auto group = item->history()->owner().groups().find(item)) {
-			return group->items.front();
-		}
-		return item;
-	};
 	const auto addItemActions = [&](
 			HistoryItem *item,
 			HistoryItem *albumPartItem) {
@@ -2476,7 +2474,7 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 							}, &st::menuIconStickers);
 							const auto isFaved = session->data().stickers().isFaved(document);
 							_menu->addAction(isFaved ? tr::lng_faved_stickers_remove(tr::now) : tr::lng_faved_stickers_add(tr::now), [=] {
-								Api::ToggleFavedSticker(controller, document, itemId);
+								Api::ToggleFavedSticker(controller->uiShow(), document, itemId);
 							}, isFaved ? &st::menuIconUnfave : &st::menuIconFave);
 						}
 						if (!hasCopyMediaRestriction(item)) {
@@ -2630,7 +2628,7 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 		HistoryView::AddWhoReactedAction(
 			_menu,
 			this,
-			_dragStateItem,
+			whoReactedItem,
 			_controller);
 	}
 
@@ -2679,12 +2677,9 @@ bool HistoryInner::showCopyRestriction(HistoryItem *item) {
 	if (!hasCopyRestriction(item)) {
 		return false;
 	}
-	Ui::ShowMultilineToast({
-		.parentOverride = Window::Show(_controller).toastParent(),
-		.text = { _peer->isBroadcast()
-			? tr::lng_error_nocopy_channel(tr::now)
-			: tr::lng_error_nocopy_group(tr::now) },
-	});
+	_controller->showToast(_peer->isBroadcast()
+		? tr::lng_error_nocopy_channel(tr::now)
+		: tr::lng_error_nocopy_group(tr::now));
 	return true;
 }
 
@@ -2692,12 +2687,9 @@ bool HistoryInner::showCopyMediaRestriction(not_null<HistoryItem*> item) {
 	if (!hasCopyMediaRestriction(item)) {
 		return false;
 	}
-	Ui::ShowMultilineToast({
-		.parentOverride = Window::Show(_controller).toastParent(),
-		.text = { _peer->isBroadcast()
-			? tr::lng_error_nocopy_channel(tr::now)
-			: tr::lng_error_nocopy_group(tr::now) },
-		});
+	_controller->showToast(_peer->isBroadcast()
+		? tr::lng_error_nocopy_channel(tr::now)
+		: tr::lng_error_nocopy_group(tr::now));
 	return true;
 }
 
@@ -2760,7 +2752,7 @@ void HistoryInner::copyContextImage(
 }
 
 void HistoryInner::showStickerPackInfo(not_null<DocumentData*> document) {
-	StickerSetBox::Show(_controller, document);
+	StickerSetBox::Show(_controller->uiShow(), document);
 }
 
 void HistoryInner::cancelContextDownload(not_null<DocumentData*> document) {
@@ -2799,7 +2791,7 @@ void HistoryInner::saveContextGif(FullMsgId itemId) {
 			if (const auto media = item->media()) {
 				if (const auto document = media->document()) {
 					Api::ToggleSavedGif(
-						_controller,
+						_controller->uiShow(),
 						document,
 						item->fullId(),
 						true);

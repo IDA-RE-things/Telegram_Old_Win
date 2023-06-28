@@ -117,7 +117,7 @@ void CheckForSwitchInlineButton(not_null<HistoryItem*> item) {
 						if (!windows.empty()) {
 							Api::SwitchInlineBotButtonReceived(
 								windows.front(),
-								QString::fromUtf8(button.data));
+								button.data);
 						}
 						return;
 					}
@@ -667,6 +667,7 @@ not_null<UserData*> Session::processUser(const MTPUser &data) {
 					result->botInfo->inlinePlaceholder = QString();
 				}
 				result->botInfo->supportsAttachMenu = data.is_bot_attach_menu();
+				result->botInfo->canEditInformation = data.is_bot_can_edit();
 			} else {
 				result->setBotInfoVersion(-1);
 			}
@@ -1354,6 +1355,9 @@ void Session::setupChannelLeavingViewer() {
 				history->removeJoinedMessage();
 				history->updateChatListExistence();
 				history->updateChatListSortPosition();
+				if (!history->inChatList()) {
+					history->clearFolder();
+				}
 			}
 		}
 	}, _lifetime);

@@ -8,27 +8,21 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "platform/linux/specific_linux.h"
 
 #include "base/random.h"
-#include "base/options.h"
 #include "base/platform/base_platform_info.h"
+#include "base/platform/linux/base_linux_glibmm_helper.h"
+#include "base/platform/linux/base_linux_dbus_utilities.h"
+#include "base/platform/linux/base_linux_xdp_utilities.h"
 #include "platform/linux/linux_desktop_environment.h"
 #include "platform/linux/linux_wayland_integration.h"
-#include "platform/platform_launcher.h"
 #include "lang/lang_keys.h"
 #include "mainwindow.h"
 #include "storage/localstorage.h"
-#include "core/sandbox.h"
+#include "core/launcher.h"
 #include "core/application.h"
-#include "core/local_url_handlers.h"
 #include "core/core_settings.h"
 #include "core/update_checker.h"
 #include "window/window_controller.h"
 #include "webview/platform/linux/webview_linux_webkitgtk.h"
-
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-#include "base/platform/linux/base_linux_glibmm_helper.h"
-#include "base/platform/linux/base_linux_dbus_utilities.h"
-#include "base/platform/linux/base_linux_xdp_utilities.h"
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 
 #ifndef DESKTOP_APP_DISABLE_X11_INTEGRATION
 #include "base/platform/linux/base_linux_xcb_utilities.h"
@@ -42,10 +36,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <kshell.h>
 #include <ksandbox.h>
 
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 #include <glibmm.h>
 #include <giomm.h>
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -54,79 +46,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <unistd.h>
 #include <dirent.h>
 #include <pwd.h>
-#include <dlfcn.h>
 
 #include <iostream>
 
 using namespace Platform;
 using Platform::internal::WaylandIntegration;
 
-#ifndef DESKTOP_APP_DISABLE_X11_INTEGRATION
-typedef struct _XDisplay Display;
-struct XErrorEvent;
-typedef int (*XErrorHandler)(Display*, XErrorEvent*);
-typedef XErrorHandler (*LPXSETERRORHANDLER)(XErrorHandler);
-#endif // !DESKTOP_APP_DISABLE_X11_INTEGRATION
-
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-typedef GApplication TDesktopApplication;
-typedef GApplicationClass TDesktopApplicationClass;
-
-G_DEFINE_TYPE(
-	TDesktopApplication,
-	t_desktop_application,
-	G_TYPE_APPLICATION)
-
-static void t_desktop_application_class_init(
-		TDesktopApplicationClass *klass) {
-	const auto application_class = G_APPLICATION_CLASS(klass);
-
-	application_class->before_emit = [](
-			GApplication *application,
-			GVariant *platformData) {
-		if (Platform::IsWayland()) {
-			static const auto keys = {
-				"activation-token",
-				"desktop-startup-id",
-			};
-			for (const auto &key : keys) {
-				const char *token = nullptr;
-				g_variant_lookup(platformData, key, "&s", &token);
-				if (token) {
-					qputenv("XDG_ACTIVATION_TOKEN", token);
-					break;
-				}
-			}
-		}
-	};
-
-	application_class->add_platform_data = [](
-			GApplication *application,
-			GVariantBuilder *builder) {
-		if (Platform::IsWayland()) {
-			const auto token = qgetenv("XDG_ACTIVATION_TOKEN");
-			if (!token.isEmpty()) {
-				g_variant_builder_add(
-					builder,
-					"{sv}",
-					"activation-token",
-					g_variant_new_string(token.constData()));
-				qunsetenv("XDG_ACTIVATION_TOKEN");
-			}
-		}
-	};
-}
-
-static void t_desktop_application_init(TDesktopApplication *application) {
-}
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-
 namespace Platform {
 namespace {
 
 constexpr auto kDesktopFile = ":/misc/org.telegram.desktop.desktop"_cs;
 
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 bool PortalAutostart(bool start, bool silent) {
 	if (cExeName().isEmpty()) {
 		return false;
@@ -153,7 +83,7 @@ bool PortalAutostart(bool start, bool silent) {
 
 		std::vector<Glib::ustring> commandline;
 		commandline.push_back(cExeName().toStdString());
-		if (Core::Sandbox::Instance().customWorkingDir()) {
+		if (Core::Launcher::Instance().customWorkingDir()) {
 			commandline.push_back("-workdir");
 			commandline.push_back(cWorkingDir().toStdString());
 		}
@@ -247,142 +177,6 @@ bool PortalAutostart(bool start, bool silent) {
 	return !error;
 }
 
-void LaunchGApplication() {
-	Glib::signal_idle().connect_once([] {
-		const auto appId = QGuiApplication::desktopFileName()
-			.chopped(8)
-			.toStdString();
-
-		const auto app = Glib::wrap(
-			G_APPLICATION(
-				g_object_new(
-					t_desktop_application_get_type(),
-					"application-id",
-					Gio::Application::id_is_valid(appId)
-						? appId.c_str()
-						: nullptr,
-					"flags",
-					G_APPLICATION_HANDLES_OPEN,
-					nullptr)));
-
-		app->signal_startup().connect([=] {
-			// GNotification
-			InvokeQueued(qApp, [] {
-				Core::App().notifications().createManager();
-			});
-
-			QEventLoop().exec();
-			app->quit();
-		}, true);
-
-		app->signal_activate().connect([] {
-			Core::Sandbox::Instance().customEnterFromEventLoop([] {
-				const auto window = Core::IsAppLaunched()
-					? Core::App().activePrimaryWindow()
-					: nullptr;
-				if (window) {
-					window->activate();
-				}
-			});
-		}, true);
-
-		app->signal_open().connect([](
-				const Gio::Application::type_vec_files &files,
-				const Glib::ustring &hint) {
-			Core::Sandbox::Instance().customEnterFromEventLoop([&] {
-				for (const auto &file : files) {
-					if (file->get_uri_scheme() == "file") {
-						gSendPaths.append(
-							QString::fromStdString(file->get_path()));
-						continue;
-					}
-					const auto url = QString::fromStdString(file->get_uri());
-					if (url.isEmpty()) {
-						continue;
-					}
-					if (url.startsWith(qstr("interpret://"))) {
-						gSendPaths.append(url);
-						continue;
-					}
-					if (Core::StartUrlRequiresActivate(url)) {
-						const auto window = Core::IsAppLaunched()
-							? Core::App().activePrimaryWindow()
-							: nullptr;
-						if (window) {
-							window->activate();
-						}
-					}
-					cSetStartUrl(url);
-					Core::App().checkStartUrl();
-				}
-
-				if (!cSendPaths().isEmpty()) {
-					Core::App().checkSendPaths();
-				}
-			});
-		}, true);
-
-		app->add_action("quit", [] {
-			Core::Sandbox::Instance().customEnterFromEventLoop([] {
-				Core::Quit();
-			});
-		});
-
-		using Window::Notifications::Manager;
-		using NotificationId = Manager::NotificationId;
-		using NotificationIdTuple = std::invoke_result_t<
-			decltype(&NotificationId::toTuple),
-			NotificationId*
-		>;
-
-		const auto notificationIdVariantType = [] {
-			try {
-				return base::Platform::MakeGlibVariant(
-					NotificationId().toTuple()).get_type();
-			} catch (...) {
-				return Glib::VariantType();
-			}
-		}();
-
-		app->add_action_with_parameter(
-			"notification-activate",
-			notificationIdVariantType,
-			[](const Glib::VariantBase &parameter) {
-				Core::Sandbox::Instance().customEnterFromEventLoop([&] {
-					try {
-						const auto &app = Core::App();
-						app.notifications().manager().notificationActivated(
-							NotificationId::FromTuple(
-								base::Platform::GlibVariantCast<
-									NotificationIdTuple
-								>(parameter)));
-					} catch (...) {
-					}
-				});
-			});
-
-		app->add_action_with_parameter(
-			"notification-mark-as-read",
-			notificationIdVariantType,
-			[](const Glib::VariantBase &parameter) {
-				Core::Sandbox::Instance().customEnterFromEventLoop([&] {
-					try {
-						const auto &app = Core::App();
-						app.notifications().manager().notificationReplied(
-							NotificationId::FromTuple(
-								base::Platform::GlibVariantCast<
-									NotificationIdTuple
-								>(parameter)),
-							{});
-					} catch (...) {
-					}
-				});
-			});
-
-		app->run(0, nullptr);
-	});
-}
-
 bool GenerateDesktopFile(
 		const QString &targetPath,
 		const QStringList &args = {},
@@ -397,6 +191,7 @@ bool GenerateDesktopFile(
 
 	const auto sourceFile = kDesktopFile.utf16();
 	const auto targetFile = targetPath + QGuiApplication::desktopFileName();
+	const auto executable = ExecutablePathForShortcuts();
 
 	const auto sourceText = [&] {
 		QFile source(sourceFile);
@@ -430,11 +225,7 @@ bool GenerateDesktopFile(
 				target->set_string(
 					group,
 					"TryExec",
-					KShell::joinArgs({
-						!Core::UpdaterDisabled()
-							? (cExeDir() + cExeName())
-							: cExeName()
-					}).replace(
+					KShell::joinArgs({ executable }).replace(
 						'\\',
 						qstr("\\\\")).toStdString());
 			}
@@ -442,10 +233,8 @@ bool GenerateDesktopFile(
 			if (target->has_key(group, "Exec")) {
 				if (group == "Desktop Entry" && !args.isEmpty()) {
 					QStringList exec;
-					exec.append(!Core::UpdaterDisabled()
-						? (cExeDir() + cExeName())
-						: cExeName());
-					if (Core::Sandbox::Instance().customWorkingDir()) {
+					exec.append(executable);
+					if (Core::Launcher::Instance().customWorkingDir()) {
 						exec.append(u"-workdir"_q);
 						exec.append(cWorkingDir());
 					}
@@ -465,10 +254,8 @@ bool GenerateDesktopFile(
 							qstr("\\")));
 
 					if (!exec.isEmpty()) {
-						exec[0] = !Core::UpdaterDisabled()
-							? (cExeDir() + cExeName())
-							: cExeName();
-						if (Core::Sandbox::Instance().customWorkingDir()) {
+						exec[0] = executable;
+						if (Core::Launcher::Instance().customWorkingDir()) {
 							exec.insert(1, u"-workdir"_q);
 							exec.insert(2, cWorkingDir());
 						}
@@ -521,7 +308,7 @@ bool GenerateDesktopFile(
 		const auto d = QFile::encodeName(QDir(cWorkingDir()).absolutePath());
 		hashMd5Hex(d.constData(), d.size(), md5Hash);
 
-		if (!Core::Sandbox::Instance().customWorkingDir()) {
+		if (!Core::Launcher::Instance().customWorkingDir()) {
 			const auto exePath = QFile::encodeName(
 				cExeDir() + cExeName());
 			hashMd5Hex(exePath.constData(), exePath.size(), md5Hash);
@@ -564,7 +351,6 @@ void InstallLauncher() {
 		applicationsPath
 	});
 }
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 
 } // namespace
 
@@ -583,31 +369,8 @@ QString SingleInstanceLocalServerName(const QString &hash) {
 #endif // !Q_OS_LINUX || Qt < 6.2.0
 }
 
+#if QT_VERSION < QT_VERSION_CHECK(6, 5, 0)
 std::optional<bool> IsDarkMode() {
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	[[maybe_unused]] static const auto Inited = [] {
-		using XDPSettingWatcher = base::Platform::XDP::SettingWatcher;
-		static const XDPSettingWatcher Watcher(
-			[=](
-				const Glib::ustring &group,
-				const Glib::ustring &key,
-				const Glib::VariantBase &value) {
-				if (group == "org.freedesktop.appearance"
-					&& key == "color-scheme") {
-					try {
-						const auto ivalue = base::Platform::GlibVariantCast<uint>(value);
-
-						crl::on_main([=] {
-							Core::App().settings().setSystemDarkMode(ivalue == 1);
-						});
-					} catch (...) {
-					}
-				}
-			});
-
-		return true;
-	}();
-
 	try {
 		const auto result = base::Platform::XDP::ReadSetting(
 			"org.freedesktop.appearance",
@@ -619,21 +382,16 @@ std::optional<bool> IsDarkMode() {
 		}
 	} catch (...) {
 	}
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 
 	return std::nullopt;
 }
+#endif // Qt < 6.5.0
 
 bool AutostartSupported() {
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 	return true;
-#else // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	return false;
-#endif // DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 }
 
 void AutostartToggle(bool enabled, Fn<void(bool)> done) {
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 	const auto success = [&] {
 		const auto silent = !done;
 
@@ -660,7 +418,6 @@ void AutostartToggle(bool enabled, Fn<void(bool)> done) {
 	if (done) {
 		done(enabled && success);
 	}
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 }
 
 bool AutostartSkip() {
@@ -685,6 +442,20 @@ bool SkipTaskbarSupported() {
 #endif // !DESKTOP_APP_DISABLE_X11_INTEGRATION
 
 	return false;
+}
+
+QString ExecutablePathForShortcuts() {
+	if (Core::UpdaterDisabled()) {
+		const auto &arguments = Core::Launcher::Instance().arguments();
+		if (!arguments.isEmpty()) {
+			const auto result = QFileInfo(arguments.first()).fileName();
+			if (!result.isEmpty()) {
+				return result;
+			}
+		}
+		return cExeName();
+	}
+	return cExeDir() + cExeName();
 }
 
 } // namespace Platform
@@ -748,7 +519,7 @@ void start() {
 
 		if (!Core::UpdaterDisabled()) {
 			QByteArray md5Hash(h);
-			if (!Launcher::Instance().customWorkingDir()) {
+			if (!Core::Launcher::Instance().customWorkingDir()) {
 				const auto exePath = QFile::encodeName(
 					cExeDir() + cExeName());
 
@@ -775,7 +546,6 @@ void start() {
 	qputenv("PULSE_PROP_application.name", AppName.utf8());
 	qputenv("PULSE_PROP_application.icon_name", base::IconName().toLatin1());
 
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 	Glib::set_prgname(cExeName().toStdString());
 	Glib::set_application_name(AppName.data());
 
@@ -793,13 +563,14 @@ void start() {
 		"Application was built without embedded fonts, "
 		"this may lead to font issues.");
 #endif // DESKTOP_APP_USE_PACKAGED_FONTS
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 
 	Webview::WebKitGTK::SetSocketPath(u"%1/%2-%3-webview-%4"_q.arg(
 		QDir::tempPath(),
 		h,
 		cGUIDStr(),
 		u"%1"_q).toStdString());
+
+	InstallLauncher();
 }
 
 void finish() {
@@ -870,27 +641,6 @@ QImage DefaultApplicationIcon() {
 namespace ThirdParty {
 
 void start() {
-	LOG(("Icon theme: %1").arg(QIcon::themeName()));
-	LOG(("Fallback icon theme: %1").arg(QIcon::fallbackThemeName()));
-
-#ifndef DESKTOP_APP_DISABLE_X11_INTEGRATION
-	// tdesktop doesn't use xlib by itself,
-	// but some libraries it depends on may do
-	const auto XSetErrorHandler = reinterpret_cast<LPXSETERRORHANDLER>(
-		dlsym(RTLD_DEFAULT, "XSetErrorHandler"));
-
-	// Reset errors if any
-	(void) dlerror();
-
-	if (XSetErrorHandler) {
-		XSetErrorHandler([](Display *dpy, XErrorEvent *err) { return 0; });
-	}
-#endif // !DESKTOP_APP_DISABLE_X11_INTEGRATION
-
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	InstallLauncher();
-	LaunchGApplication();
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
 }
 
 void finish() {

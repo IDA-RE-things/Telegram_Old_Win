@@ -37,7 +37,7 @@ get_filename_component(submodules_loc "Telegram" REALPATH)
 get_filename_component(cmake_helpers_loc "cmake" REALPATH)
 
 if (NOT DESKTOP_APP_USE_PACKAGED AND WIN32)
-    set(Python_EXECUTABLE ${CMAKE_CURRENT_SOURCE_DIR}/../ThirdParty/python/Scripts/python)
+    set(Python3_EXECUTABLE ${CMAKE_CURRENT_SOURCE_DIR}/../ThirdParty/python/Scripts/python)
 endif()
 
 include(cmake/variables.cmake)
@@ -56,7 +56,7 @@ include(cmake/options.cmake)
 
 if (NOT DESKTOP_APP_USE_PACKAGED)
     if (WIN32)
-        set(qt_version 5.15.8)
+        set(qt_version 5.15.9)
     elseif (APPLE)
         set(qt_version 6.3.2)
     endif()
